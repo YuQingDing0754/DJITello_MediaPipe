@@ -1,4 +1,3 @@
-# COPYRIGHT. YUQING DING (SCOTT)
 import cv2
 import numpy as np
 import time
@@ -64,6 +63,14 @@ left_wave_detected = False  # 是否检测到完整的左手挥手动作
 left_wave_cooldown = 0  # 挥手检测冷却时间(避免误触)
 performing_stunt = False  # 是否正在执行特技动作
 stunt_position = None  # 特技动作前的位置
+# 手势检测相关参数
+mp_hands = mp.solutions.hands
+hands_results = None
+hands_processing_active = True
+peace_sign_detected = False
+peace_sign_cooldown = 0
+PEACE_SIGN_COOLDOWN = 30
+performing_photo_stunt = False
 
 # 避障参数
 obstacle_detection_enabled = True
@@ -255,7 +262,244 @@ def calculate_avoidance_vector(obstacle_regions, other_people, target_position):
                 avoid_y += norm_dy * force
     
     return avoid_x, avoid_y
+# 创建手部检测线程函数
+def hands_detection_thread():
+    """在独立线程中执行手部检测"""
+    global frame_buffer, hands_results, hands_processing_active
+    
+    frame_count = 0
+    last_process_time = time.time()
+    
+    # 提高手部检测质量的参数
+    with mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        min_detection_confidence=0.4,  # 增加信心度阈值
+        min_tracking_confidence=0.4,   # 增加跟踪信心度阈值
+        model_complexity=1            # 使用更复杂的模型来提高精度
+    ) as hands_detector:
+        while hands_processing_active:
+            # 按照自适应帧率跳过帧
+            skip_frames = adaptive_frame_skip()
+            
+            # 确保帧缓冲区有内容
+            if len(frame_buffer) > 0:
+                frame_count += 1
+                
+                # 跳过一些帧以减轻处理负担
+                if frame_count % skip_frames != 0:
+                    continue
+                
+                # 获取最新帧
+                frame = frame_buffer[-1].copy()
+                
+                # 使用低分辨率进行处理
+                if LOW_RES_PROCESSING:
+                    process_frame = cv2.resize(frame, PROCESS_RESOLUTION)
+                else:
+                    process_frame = frame.copy()
+                
+                # 转换颜色空间(MediaPipe需要RGB)
+                image_rgb = cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB)
+                image_rgb.flags.writeable = False
+                
+                # 进行手部检测
+                results = hands_detector.process(image_rgb)
+                
+                # 更新全局手部检测结果
+                hands_results = results
+            
+            # 避免过高CPU使用率
+            time.sleep(0.01)
 
+# 使用MediaPipe Hands检测剪刀手
+def detect_peace_sign_with_hands():
+    """使用更宽容的标准检测剪刀手手势"""
+    global hands_results, peace_sign_detected, peace_sign_cooldown, performing_photo_stunt
+    
+    if peace_sign_cooldown > 0 or performing_photo_stunt:
+        peace_sign_cooldown -= 1
+        return False
+    
+    if not hands_results or not hands_results.multi_hand_landmarks:
+        return False
+    
+    for hand_idx, hand_landmarks in enumerate(hands_results.multi_hand_landmarks):
+        if hand_idx >= len(hands_results.multi_handedness):
+            continue
+            
+        # Get hand type if available
+        is_right_hand = True
+        if len(hands_results.multi_handedness) > hand_idx:
+            handedness = hands_results.multi_handedness[hand_idx].classification[0].label
+            is_right_hand = (handedness == "Right")
+        
+        # Extract finger landmarks
+        index_tip = hand_landmarks.landmark[8]    # 食指指尖
+        index_pip = hand_landmarks.landmark[6]    # 食指中间关节
+        index_mcp = hand_landmarks.landmark[5]    # 食指根部
+        
+        middle_tip = hand_landmarks.landmark[12]  # 中指指尖
+        middle_pip = hand_landmarks.landmark[10]  # 中指中间关节
+        
+        ring_tip = hand_landmarks.landmark[16]    # 无名指指尖
+        pinky_tip = hand_landmarks.landmark[20]   # 小指指尖
+        
+        # 1. More flexible check if index and middle fingers are extended
+        # Check both vertical and slight angle orientations
+        index_extended = (index_tip.y < index_pip.y - 0.01)
+        middle_extended = (middle_tip.y < middle_pip.y - 0.01)
+        
+        # 2. Check if ring and pinky fingers are lower than index/middle
+        # This is more reliable than checking if they're bent
+        other_fingers_lower = ((ring_tip.y > index_tip.y) and 
+                              (pinky_tip.y > index_tip.y))
+        
+        # 3. Check finger separation with a lower threshold
+        finger_distance = math.sqrt(
+            (index_tip.x - middle_tip.x)**2 + 
+            (index_tip.y - middle_tip.y)**2
+        )
+        fingers_apart = finger_distance > 0.015  # Lower threshold
+        
+        # Use more relaxed peace sign detection
+        is_peace_sign = index_extended and middle_extended and fingers_apart
+        
+        # Debug output to help tune parameters
+        print(f"Hand analysis: Extended: {index_extended}/{middle_extended}, " 
+              f"Others lower: {other_fingers_lower}, Distance: {finger_distance:.4f}")
+        
+        if is_peace_sign:
+            print(f"检测到剪刀手! 指尖距离: {finger_distance:.4f}")
+            peace_sign_detected = True
+            peace_sign_cooldown = PEACE_SIGN_COOLDOWN
+            return True
+    
+    return False
+
+# 执行拍照和特技动作序列
+def perform_photo_stunt_sequence(frame):
+    """执行拍照并进行特技飞行"""
+    global performing_photo_stunt, stunt_position, pError_x, pError_y, pError_z, pError_yaw, peace_sign_detected
+    
+    try:
+        print("开始执行拍照特技动作")
+        performing_photo_stunt = True
+        # Record current position
+        stunt_position = (pError_x, pError_y, pError_z, pError_yaw)
+        
+        # 0. 拍照前先移动到更高的位置以更好地拍摄人脸
+        try:
+            # 稍微上升一点，以便更好地拍摄人脸
+            tello.send_rc_control(0, 0, 20, 0)  # 上升
+            time.sleep(0.5)
+            tello.send_rc_control(0, 0, 0, 0)   # 停止
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"调整高度失败: {e}")
+        
+        # 1. 获取原始视频帧（无UI叠加）并保存
+        try:
+            # 获取无人机视频帧（无UI叠加）
+            raw_frame = tello.get_frame_read().frame
+            # 调整分辨率
+            raw_frame = cv2.resize(raw_frame, DISPLAY_RESOLUTION)
+            # 转换BGR到RGB然后再到BGR (修复蓝精灵问题)
+            raw_frame = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+            # 保存照片
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            photo_path = f"tello_photo_{timestamp}.jpg"
+            cv2.imwrite(photo_path, raw_frame)
+            print(f"照片已保存: {photo_path}")
+        except Exception as e:
+            print(f"拍照失败: {e}")
+            # 如果无法获取原始帧，则使用当前帧（可能包含UI）
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            photo_path = f"tello_photo_{timestamp}.jpg"
+            cv2.imwrite(photo_path, frame)
+            print(f"使用处理后的帧保存照片: {photo_path}")
+        
+        
+        # 3. 执行后翻转 - 添加防失速预处理
+        try:
+            # 预先加速马达到最高速度而不移动 (短暂快速地左右摇摆)
+            print("预热马达到最高转速...")
+            tello.send_rc_control(0, 0, 0, 50)  # 快速右转
+            time.sleep(0.2)
+            tello.send_rc_control(0, 0, 0, -50)  # 快速左转
+            time.sleep(0.2)
+            tello.send_rc_control(0, 0, 0, 0)    # 停止旋转
+            time.sleep(0.1)
+            
+            # 短暂上升一点以获得更多高度空间
+            tello.send_rc_control(0, 0, 40, 0)   # 快速上升
+            time.sleep(0.3)
+            tello.send_rc_control(0, 0, 0, 0)    # 停止上升
+            time.sleep(0.1)
+            
+            # 现在执行翻转 - 马达已经在高速运行
+            print("执行后翻转")
+            tello.flip_back()
+            time.sleep(2)  # 给足够时间完成翻转
+        except Exception as e:
+            print(f"翻转失败: {e}")
+        # 尝试备用翻转方式
+        try:
+            print("尝试备用翻转方式")
+            # 再次预热马达
+            tello.send_rc_control(0, 0, 30, 0)  # 上升
+            time.sleep(0.3)
+            tello.send_rc_control(0, 0, 0, 0)   # 停止
+            time.sleep(0.1)
+            
+            # 使用直接命令
+            tello.send_command_without_return("flip b")
+            time.sleep(2)
+        except Exception as e2:
+            print(f"备用翻转也失败: {e2}")
+                
+        # 4. 保持马达旋转 - 通过快速左右小幅度旋转实现
+        try:
+            for _ in range(3):  # 重复几次小幅度旋转
+                tello.send_rc_control(0, 0, 0, 30)  # 右转
+                time.sleep(0.3)
+                tello.send_rc_control(0, 0, 0, -30)  # 左转
+                time.sleep(0.3)
+            tello.send_rc_control(0, 0, 0, 0)  # 停止旋转
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"马达旋转失败: {e}")
+        
+        # 5. 恢复到原始位置
+        try:
+            # 使用原来的误差参数来恢复相对位置
+            error_x, error_y, error_z, error_yaw = stunt_position
+            
+            # 计算PID控制
+            speed_x = pid_x[0] * error_x
+            speed_y = pid_y[0] * error_y
+            speed_z = pid_z[0] * error_z
+            speed_yaw = pid_yaw[0] * error_yaw
+            
+            # 限制速度范围
+            lr_velocity = int(np.clip(speed_x, -20, 20))
+            fb_velocity = int(np.clip(speed_z, -20, 20))
+            ud_velocity = int(-np.clip(speed_y, -20, 20))
+            yaw_velocity = int(np.clip(speed_yaw, -20, 20))
+            
+            # 发送控制命令，恢复位置
+            tello.send_rc_control(lr_velocity, fb_velocity, ud_velocity, yaw_velocity)
+            time.sleep(1.5)
+            
+            # 恢复悬停
+            tello.send_rc_control(0, 0, 0, 0)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"位置恢复失败: {e}")
+    except Exception as e:
+        print(f"拍照特技执行错误: {e}")
+    
+    performing_photo_stunt = False
 # 人体目标选择函数
 def select_target(results_list, predicted_position=None):
     """从多个检测结果中选择目标，考虑预测位置"""
@@ -706,6 +950,7 @@ def track_person(frame, results, pid_x, pid_y, pid_z, pid_yaw, pError_x, pError_
             cv2.circle(frame, predicted_position, 10, (0, 165, 255), -1)  # 橙色圆点
             cv2.putText(frame, "Predicted", (predicted_position[0] + 15, predicted_position[1]), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+            
     
     # 如果没有检测到人体
     if not pose_results:
@@ -811,6 +1056,18 @@ def track_person(frame, results, pid_x, pid_y, pid_z, pid_yaw, pError_x, pError_
         performing_stunt = True
         # 在新线程中执行特技动作，避免阻塞主线程
         threading.Thread(target=perform_stunt_sequence).start()
+        return frame, pError_x, pError_y, pError_z, pError_yaw
+        
+    # 检测剪刀手手势(使用MediaPipe Hands)
+    if detect_peace_sign_with_hands():
+        peace_sign_detected = True
+        frame = cv2_add_chinese_text(frame, "检测到剪刀手! 准备拍照并执行特技...", 
+                                   (frame_center_x-180, frame_center_y), (0, 255, 255), 40)
+                                   
+        # 在新线程中执行拍照和特技动作，避免阻塞主线程
+        photo_thread = threading.Thread(target=lambda: perform_photo_stunt_sequence(frame.copy()))
+        photo_thread.daemon = True
+        photo_thread.start()
         return frame, pError_x, pError_y, pError_z, pError_yaw
     
     # 绘制右手轨迹用于调试
@@ -1111,6 +1368,16 @@ def pose_detection_thread():
                         mp_drawing.DrawingSpec(color=(66, 245, 117), thickness=2, circle_radius=2),
                         mp_drawing.DrawingSpec(color=(230, 66, 245), thickness=2, circle_radius=1)
                     )
+                if hands_results and hands_results.multi_hand_landmarks:
+                    for hand_landmarks in hands_results.multi_hand_landmarks:
+        # 绘制所有21个手部关键点和连接线
+                        mp_drawing.draw_landmarks(
+                        display_image,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing.DrawingSpec(color=(0, 255, 255), thickness=3, circle_radius=4),
+                        mp_drawing.DrawingSpec(color=(255, 0, 255), thickness=2, circle_radius=2)
+                    )    
                 
                 # 人体跟随处理
                 display_image, px, py, pz, pyaw = track_person(
@@ -1149,6 +1416,7 @@ def display_thread():
         
         # 避免过高CPU使用率
         time.sleep(0.001)
+
 
 # 处理按键事件
 def process_key_press(key):
@@ -1220,7 +1488,7 @@ def initialize_tello():
 
 # 主程序
 def main():
-    global tello, processing_active, display_active, right_wave_detected
+    global tello, processing_active, display_active, right_wave_detected,hands_processing_active
     
     try:
         # 初始化无人机
@@ -1238,6 +1506,11 @@ def main():
         detection_thread = threading.Thread(target=pose_detection_thread)
         detection_thread.daemon = True
         detection_thread.start()
+        
+        # 启动手部检测线程
+        hands_thread = threading.Thread(target=hands_detection_thread)
+        hands_thread.daemon = True
+        hands_thread.start()
         
         # 启动显示线程
         disp_thread = threading.Thread(target=display_thread)
@@ -1277,7 +1550,7 @@ def main():
         # 设置标志通知线程停止
         processing_active = False
         display_active = False
-        
+        hands_processing_active = False
         # 确保无人机降落
         print("程序结束，正在降落...")
         if tello:
